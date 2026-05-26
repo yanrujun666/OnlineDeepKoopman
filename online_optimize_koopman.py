@@ -1,6 +1,8 @@
 import argparse
 from collections import deque
 import os
+import time
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,67 @@ from torch.utils.data import ConcatDataset
 
 import finetune_koopman as ft
 from src.loader import VehicleDynamicDataset5C
+
+
+def create_run_id():
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+def init_online_run_paths(condition, run_id):
+    log_dir = os.path.join('log', 'online-koopman', condition)
+    ckpt_dir = os.path.join('ckpt', 'online-koopman', condition)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f'{run_id}.log')
+    metric_path = os.path.join(log_dir, f'{run_id}_metrics.csv')
+    ckpt_path = os.path.join(ckpt_dir, f'{run_id}.pth')
+    return log_path, metric_path, ckpt_path
+
+
+class RunLogger:
+    def __init__(self, log_path, run_id):
+        self.log_path = log_path
+        self.run_id = run_id
+        self.run_start = datetime.now()
+
+    def _emit(self, line):
+        print(line, flush=True)
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+
+    def blank(self):
+        print(flush=True)
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write('\n')
+
+    def write(self, msg, phase=None, timestamp=True):
+        parts = []
+        if timestamp:
+            parts.append(f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]')
+        if phase:
+            parts.append(f'[{phase}]')
+        parts.append(str(msg))
+        self._emit(' '.join(parts))
+
+    def write_header(self, config_lines):
+        self.blank()
+        self._emit('=' * 60)
+        self._emit(f'run_id={self.run_id}')
+        self._emit(f'Run started at {self.run_start.strftime("%Y-%m-%d %H:%M:%S")}')
+        self.blank()
+        for line in config_lines:
+            if line.startswith('run_id='):
+                continue
+            self._emit(line)
+        self.blank()
+        self._emit('=' * 60)
+        self.blank()
+
+    def finish_run(self):
+        self.blank()
+        total = (datetime.now() - self.run_start).total_seconds()
+        self.write(f'Run finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', phase='summary')
+        self.write(f'Total elapsed: {total:.1f}s', phase='summary')
 
 
 def _prepare_sequence_batch(sample, encoder):
@@ -232,15 +295,36 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for online updates.')
     parser.add_argument('--reg-lambda', type=float, default=1e-3, help='Regularization weight around initial Koopman params.')
     parser.add_argument('--max-steps', type=int, default=-1, help='Optional: limit number of online steps.')
-    parser.add_argument('--metric-log-path', type=str, default='log/online_koopman_metrics.csv', help='CSV path to save per-step 100-step prediction metrics.')
-    parser.add_argument('--save-path', type=str, default='', help='Optional checkpoint save path.')
+    parser.add_argument('--metric-log-path', type=str, default=None, help='CSV path for per-step metrics. Default: log/online-koopman/{CONDITION}/{run_id}_metrics.csv')
+    parser.add_argument('--save-path', type=str, default=None, help='Checkpoint save path. Default: ckpt/online-koopman/{CONDITION}/{run_id}.pth')
     args = parser.parse_args()
+
+    run_id = create_run_id()
+    log_path, default_metric_path, default_ckpt_path = init_online_run_paths(args.condition, run_id)
+    metric_log_path = args.metric_log_path or default_metric_path
+    save_path = args.save_path or default_ckpt_path
+    logger = RunLogger(log_path, run_id)
 
     ft.DEVICE = torch.device(args.device)
     ft.CONDITION = args.condition
     ft.CONTROL_MIN = ft.CONTROL_MIN.to(ft.DEVICE)
     ft.CONTROL_MAX = ft.CONTROL_MAX.to(ft.DEVICE)
-    ft.WEIGHTS = ft.WEIGHTS.to(ft.DEVICE)
+
+    logger.write_header([
+        'script=online_optimize_koopman.py',
+        f'condition={args.condition}',
+        'base_checkpoint=base.pth',
+        f'log_path={log_path}',
+        f'metric_log_path={metric_log_path}',
+        f'checkpoint_path={save_path}',
+        f'device={args.device}',
+        f'window_size={args.window_size}',
+        f'trigger_threshold={args.trigger_threshold}',
+        f'update_epochs={args.update_epochs}',
+        f'lr={args.lr}',
+        f'reg_lambda={args.reg_lambda}',
+        f'max_steps={args.max_steps}',
+    ])
 
     encoder, dkm = ft.build_model()
     encoder = encoder.to(ft.DEVICE)
@@ -248,8 +332,9 @@ def main():
 
     train_loader, val_loader = build_online_loaders(args.window_size)
 
-    print('\nBefore online optimization:')
-    ft.eval(encoder, dkm, val_loader, 0, ft.CONDITION)
+    logger.write('Validation metrics before online optimization', phase='valid')
+    online_start = time.time()
+    ft.eval(encoder, dkm, val_loader, 0, ft.CONDITION, logger=logger, split='validation')
 
     dkm, metric_logs = online_optimize_koopman(
         encoder=encoder,
@@ -262,41 +347,48 @@ def main():
         reg_lambda=args.reg_lambda,
         max_steps=args.max_steps
     )
+    online_elapsed = time.time() - online_start
+    logger.write(f'Online optimization elapsed: {online_elapsed:.1f}s', phase='summary')
 
-    if args.metric_log_path:
-        log_dir = os.path.dirname(args.metric_log_path)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        with open(args.metric_log_path, 'w') as f:
-            f.write('step,ade_xy_100,fde_xy_100,mse_state_100,triggered,update_state_loss,update_reg_loss\n')
-            for m in metric_logs:
-                f.write(
-                    f"{m['step']},{m['ade_xy_100']:.8f},{m['fde_xy_100']:.8f},{m['mse_state_100']:.8f},"
-                    f"{m['triggered']},{m['update_state_loss']:.8f},{m['update_reg_loss']:.8f}\n"
-                )
-        print(f'Saved online metrics to: {args.metric_log_path}')
+    log_dir = os.path.dirname(metric_log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    with open(metric_log_path, 'w', encoding='utf-8') as f:
+        f.write('run_id,step,ade_xy_100,fde_xy_100,mse_state_100,triggered,update_state_loss,update_reg_loss\n')
+        for m in metric_logs:
+            f.write(
+                f"{run_id},{m['step']},{m['ade_xy_100']:.8f},{m['fde_xy_100']:.8f},{m['mse_state_100']:.8f},"
+                f"{m['triggered']},{m['update_state_loss']:.8f},{m['update_reg_loss']:.8f}\n"
+            )
+    logger.write(f'Saved online metrics to: {metric_log_path}', phase='summary')
 
-    print('\nAfter online optimization:')
+    logger.write('Validation metrics after online optimization', phase='valid')
     dkm_avg_eval_error, dkm_final_eval_error, \
         vx_eval_error, vy_eval_error, wz_eval_error, \
-        yaw_avg_eval_error, yaw_final_eval_error = ft.eval(encoder, dkm, val_loader, 0, ft.CONDITION)
+        yaw_avg_eval_error, yaw_final_eval_error = ft.eval(encoder, dkm, val_loader, 0, ft.CONDITION, logger=logger, split='validation')
 
-    if args.save_path:
-        weight = {
-            'encoder': encoder.state_dict().copy(),
-            'koopman': dkm.state_dict().copy(),
-            'eval_results': {
-                'dkm_mde': dkm_avg_eval_error.item(),
-                'dkm_fde': dkm_final_eval_error.item(),
-                'dkm_mae': yaw_avg_eval_error.item(),
-                'dkm_fae': yaw_final_eval_error.item(),
-                'vx_error': vx_eval_error.item(),
-                'vy_error': vy_eval_error.item(),
-                'wz_error': wz_eval_error.item(),
-            }
-        }
-        torch.save(weight, args.save_path)
-        print(f'Saved checkpoint to: {args.save_path}')
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    weight = {
+        'encoder': encoder.state_dict().copy(),
+        'koopman': dkm.state_dict().copy(),
+        'eval_results': {
+            'dkm_mde': dkm_avg_eval_error.item(),
+            'dkm_fde': dkm_final_eval_error.item(),
+            'dkm_mae': yaw_avg_eval_error.item(),
+            'dkm_fae': yaw_final_eval_error.item(),
+            'vx_error': vx_eval_error.item(),
+            'vy_error': vy_eval_error.item(),
+            'wz_error': wz_eval_error.item(),
+        },
+        'run_id': run_id,
+        'condition': args.condition,
+    }
+    torch.save(weight, save_path)
+    logger.write(f'Saved checkpoint to: {save_path}', phase='summary')
+
+    logger.finish_run()
 
 
 if __name__ == '__main__':

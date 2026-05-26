@@ -2,10 +2,12 @@ import torch
 import tqdm
 import torch.nn.functional as F
 import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import shutil
 import random
+from datetime import datetime
 
 from torch.utils.data import ConcatDataset
 
@@ -27,12 +29,80 @@ def set_seed(seed):
 
 set_seed(42)
 
+def create_run_id():
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+def init_run_paths(script_name, condition, run_id):
+    log_dir = os.path.join('log', script_name, condition)
+    ckpt_dir = os.path.join('ckpt', script_name, condition)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    return os.path.join(log_dir, f'{run_id}.log'), os.path.join(ckpt_dir, f'{run_id}.pth')
+
+
+class RunLogger:
+    def __init__(self, log_path, run_id):
+        self.log_path = log_path
+        self.run_id = run_id
+        self.run_start = datetime.now()
+        self._epoch_start = None
+
+    def _emit(self, line):
+        print(line, flush=True)
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+
+    def blank(self):
+        print(flush=True)
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write('\n')
+
+    def write(self, msg, phase=None, timestamp=True):
+        parts = []
+        if timestamp:
+            parts.append(f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]')
+        if phase:
+            parts.append(f'[{phase}]')
+        parts.append(str(msg))
+        self._emit(' '.join(parts))
+
+    def write_header(self, config_lines):
+        self.blank()
+        self._emit('=' * 60)
+        self._emit(f'run_id={self.run_id}')
+        self._emit(f'Run started at {self.run_start.strftime("%Y-%m-%d %H:%M:%S")}')
+        self.blank()
+        for line in config_lines:
+            if line.startswith('run_id='):
+                continue
+            self._emit(line)
+        self.blank()
+        self._emit('=' * 60)
+        self.blank()
+
+    def start_epoch(self, epoch):
+        if epoch > 0:
+            self.blank()
+        self._epoch_start = time.time()
+        self._emit(f'--- Epoch {epoch} ---')
+
+    def end_epoch(self, epoch):
+        elapsed = time.time() - self._epoch_start if self._epoch_start is not None else 0.0
+        self.write(f'finished, elapsed={elapsed:.1f}s', phase='epoch')
+
+    def finish_run(self):
+        self.blank()
+        total = (datetime.now() - self.run_start).total_seconds()
+        self.write(f'Run finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', phase='summary')
+        self.write(f'Total elapsed: {total:.1f}s', phase='summary')
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 ITERS = 100
 BATCH_SIZE = 512
-MAX_EPOCH = 100
+MAX_EPOCH = 16
 DEVICE = torch.device('cuda:0')
 CONTROL_MIN = torch.tensor([-1500, -1500, -1500, -1500, -1500, -1500, -np.pi/2, -np.pi/2, -np.pi/2, -np.pi/2, -np.pi/2, -np.pi/2]).to(DEVICE)
 CONTROL_MAX = torch.tensor([1500, 1500, 1500, 1500, 1500, 1500, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2, np.pi/2]).to(DEVICE)
@@ -91,7 +161,7 @@ def build_optimizer(encoder, dkm):
     return optimizer, scheduler
 
 
-def train(encoder, dkm, loader, optimizer, scheduler, encoder_old=None, dkm_old=None):
+def train(encoder, dkm, loader, optimizer, scheduler, encoder_old=None, dkm_old=None, logger=None):
     qbar = tqdm.tqdm(loader)
     encoder.eval()
     dkm.train()
@@ -227,14 +297,22 @@ def train(encoder, dkm, loader, optimizer, scheduler, encoder_old=None, dkm_old=
     vy_eval_error /= (sample_cnt * ITERS)
     wz_eval_error /= (sample_cnt * ITERS)
     
-    print('Train:')
-    print('DKM model mean error: %.4f' % dkm_avg_eval_error.item(), 'final error: %.4f' % dkm_final_eval_error.item())
-    print('vx_eval_error: %.4f' % vx_eval_error.item(), 'vy_eval_error: %.4f' % vy_eval_error.item(), 'wz_eval_error: %.4f' % wz_eval_error.item())
+    lines = [
+        'Train:',
+        f'DKM model mean error: {dkm_avg_eval_error.item():.6f}, final error: {dkm_final_eval_error.item():.6f}',
+        f'vx_eval_error: {vx_eval_error.item():.6f}, vy_eval_error: {vy_eval_error.item():.6f}, wz_eval_error: {wz_eval_error.item():.6f}',
+    ]
+    if logger:
+        for line in lines:
+            logger.write(line, phase='train')
+    else:
+        for line in lines:
+            print(line)
 
     return encoder, dkm, epoch_avg_loss / len(qbar), dkm_avg_eval_error, dkm_final_eval_error, vx_eval_error, vy_eval_error, wz_eval_error
 
 
-def eval(encoder, dkm, loader, ei, condition):
+def eval(encoder, dkm, loader, ei, condition, logger=None, split='train'):
     qbar = tqdm.tqdm(loader)
     encoder.eval()
     dkm.eval()
@@ -298,23 +376,64 @@ def eval(encoder, dkm, loader, ei, condition):
     vy_eval_error /= (sample_cnt * ITERS)
     wz_eval_error /= (sample_cnt * ITERS)
     
-    print('Valid on %s:' % condition)
-    print('DKM model ADE: %.4f' % dkm_avg_eval_error.item(), 'FDE: %.4f' % dkm_final_eval_error.item())
-    print('DKM model average yaw error: %.4f' % yaw_avg_eval_error.item(), 'final yaw error: %.4f' % yaw_final_eval_error.item())
-    print('vx_eval_error: %.4f' % vx_eval_error.item(), 'vy_eval_error: %.4f' % vy_eval_error.item(), 'wz_eval_error: %.4f' % wz_eval_error.item())
+    phase = 'train_eval' if split == 'train' else 'valid'
+    lines = [
+        f'Eval on {condition} {split} set (epoch {ei}):',
+        f'DKM model ADE: {dkm_avg_eval_error.item():.6f}, FDE: {dkm_final_eval_error.item():.6f}',
+        f'DKM model average yaw error: {yaw_avg_eval_error.item():.6f}, final yaw error: {yaw_final_eval_error.item():.6f}',
+        f'vx_eval_error: {vx_eval_error.item():.6f}, vy_eval_error: {vy_eval_error.item():.6f}, wz_eval_error: {wz_eval_error.item():.6f}',
+    ]
+    if logger:
+        for line in lines:
+            logger.write(line, phase=phase)
+    else:
+        for line in lines:
+            print(line)
 
     return dkm_avg_eval_error, dkm_final_eval_error, vx_eval_error, vy_eval_error, wz_eval_error, yaw_avg_eval_error, yaw_final_eval_error
 
 if __name__ == '__main__':
 
+    run_id = create_run_id()
+    log_filname, ckpt_filname = init_run_paths('finetune-koopman', CONDITION, run_id)
+    logger = RunLogger(log_filname, run_id)
+
+    condition_dir_dict = {
+        'AA': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungA-LfmA',
+        'AB': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungA-LfmB',
+        'AC': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungA-LfmC',
+        'BA': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungB-LfmA',
+        'BB': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungB-LfmB',
+        'BC': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungB-LfmC',
+        'CA': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungC-LfmA',
+        'CB': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungC-LfmB',
+        'CC': 'data/data_scenarios_for_differ_params_v8/VehicleParams_IzuA_IzulA_RrA_CdA_BcdA-m_sprungC-LfmC',
+    }
+    data_dir = condition_dir_dict[CONDITION]
+
+    logger.write_header([
+        'script=finetune_koopman.py',
+        f'condition={CONDITION}',
+        f'data_dir={data_dir}',
+        'base_checkpoint=base.pth',
+        f'checkpoint_path={ckpt_filname}',
+        f'log_path={log_filname}',
+        f'device={DEVICE}',
+        'seed=42',
+        f'ITERS={ITERS}',
+        f'BATCH_SIZE={BATCH_SIZE}',
+        f'MAX_EPOCH={MAX_EPOCH}',
+        'optimizer=Adam(lr=1e-5, weight_decay=1e-5) on koopman only',
+        'scheduler=StepLR(step_size=50, gamma=0.9)',
+        'trainable=koopman (encoder frozen)',
+        'eval_split=train',
+        'early_stopping_patience=1000',
+        'early_stopping_restore_best_weights=False',
+    ])
+
     encoder, dkm = build_model()
     encoder = encoder.to(DEVICE)
     dkm = dkm.to(DEVICE)
-    encoder_old = {k: v.clone() for k, v in encoder.state_dict().items()}
-    dkm_old = {k: v.clone() for k, v in dkm.state_dict().items()}
-
-    log_filname = 'log/finetune-koopman-%s.log' % CONDITION 
-    ckpt_filname = 'ckpt/finetune-koopman-%s.pth' % CONDITION
 
     train_loader, valid_loader = build_loader()
 
@@ -322,47 +441,22 @@ if __name__ == '__main__':
 
     early_stopping = EarlyStopping(patience=1000, min_delta=0.0, restore_best_weights=False, weight_save_fpath=ckpt_filname)
 
-    if os.path.exists(log_filname):
-        os.remove(log_filname)
-
-    dkm_avg_eval_error, dkm_final_eval_error, \
-        vx_eval_error, vy_eval_error, wz_eval_error, \
-            yaw_avg_eval_error, yaw_final_eval_error = eval(encoder, dkm, train_loader, 0, CONDITION)
-
-    with open(log_filname, 'a') as f:
-        f.write(f'0\n')
-        f.write(f'{CONDITION} condition:\n')
-        f.write(f'DKM model ADE: {dkm_avg_eval_error.item()}, FDE: {dkm_final_eval_error.item()}\n')
-        f.write(f'DKM model yaw avg error: {yaw_avg_eval_error.item()}, yaw final error: {yaw_final_eval_error.item()}\n')
-        f.write(f'vx_eval_error: {vx_eval_error.item()}, vy_eval_error: {vy_eval_error.item()}, wz_eval_error: {wz_eval_error.item()}\n')
-
+    logger.write('Initial evaluation on train set before training', phase='train_eval')
+    eval(encoder, dkm, train_loader, 0, CONDITION, logger=logger)
 
     for ei in range(MAX_EPOCH):
-        print('Epoch', ei)
+        logger.start_epoch(ei)
         encoder, dkm, train_loss, \
              dkm_avg_eval_error, dkm_final_eval_error, \
-                vx_eval_error, vy_eval_error, wz_eval_error = train(encoder, dkm, train_loader, optimizer, scheduler) #, encoder_old, dkm_old)
-        print('Train epoch loss:', train_loss)
-
-        with open(log_filname, 'a') as f:
-            f.write(f'{ei}\n')
-            f.write(f'train epoch mean loss: {train_loss}\n')
-            f.write(f'DKM model mean error: {dkm_avg_eval_error.item()}, final error: {dkm_final_eval_error.item()}\n')
-            f.write(f'vx_eval_error: {vx_eval_error.item()}, vy_eval_error: {vy_eval_error.item()}, wz_eval_error: {wz_eval_error.item()}\n')
-
+                vx_eval_error, vy_eval_error, wz_eval_error = train(
+                    encoder, dkm, train_loader, optimizer, scheduler, logger=logger)
+        logger.write(f'train epoch mean loss: {train_loss:.6f}', phase='train')
 
         results = {}
 
         dkm_avg_eval_error, dkm_final_eval_error, \
             vx_eval_error, vy_eval_error, wz_eval_error, \
-                yaw_avg_eval_error, yaw_final_eval_error = eval(encoder, dkm, train_loader, ei, CONDITION)
-
-        with open(log_filname, 'a') as f:
-            f.write(f'{ei}\n')
-            f.write(f'{CONDITION} condition:\n')
-            f.write(f'DKM model ADE: {dkm_avg_eval_error.item()}, FDE: {dkm_final_eval_error.item()}\n')
-            f.write(f'DKM model yaw avg error: {yaw_avg_eval_error.item()}, yaw final error: {yaw_final_eval_error.item()}\n')
-            f.write(f'vx_eval_error: {vx_eval_error.item()}, vy_eval_error: {vy_eval_error.item()}, wz_eval_error: {wz_eval_error.item()}\n')
+                yaw_avg_eval_error, yaw_final_eval_error = eval(encoder, dkm, train_loader, ei, CONDITION, logger=logger)
 
         results['real'] = {
             'dkm_mde': dkm_avg_eval_error.item(),
@@ -380,29 +474,24 @@ if __name__ == '__main__':
             'best_loss': train_loss,
             'eval_results': results,
             'epoch': ei,
+            'run_id': run_id,
+            'condition': CONDITION,
         }
         early_stopping(train_loss, model_weight)
+        logger.end_epoch(ei)
         
         if early_stopping.early_stop or (ei == MAX_EPOCH - 1):
             best_weight = early_stopping.best_weights
-            print()
-            print(f"Early stopping at epoch {best_weight['epoch']}")
+            logger.write(f"Early stopping at epoch {best_weight['epoch']}", phase='summary')
             results = best_weight['eval_results']
             for ck in ['real']:
-                print(ck)
+                logger.write(ck, phase='summary')
                 result_c = results[ck]
                 for rk in result_c.keys():
-                    print(rk, ':%.4f' % result_c[rk])
-
-            with open(log_filname, 'a') as f:
-                f.write('\n')
-                f.write(f"Early stopping at epoch {best_weight['epoch']}\n")
-                for ck in ['real']:
-                    f.write(f'{ck}\n')
-                    result_c = results[ck]
-                    for rk in result_c.keys():
-                        f.write(f'{rk}: {result_c[rk]:.4f}\n')
-        
+                    logger.write(f'{rk}: {result_c[rk]:.6f}', phase='summary')
+            logger.write(f'Saved checkpoint: {ckpt_filname}', phase='summary')
             break
 
         scheduler.step()
+
+    logger.finish_run()
