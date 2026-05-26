@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data
+data/
+
+# Training logs & metrics
+log/
+*.log
+*.csv
+
+# Checkpoints & model weights
+ckpt/
+*.pth
+!base.pth
+*.pt
+*.ckpt
+
+# Generated figures
+trajectory.png
+
+# OS
+.DS_Store
+Thumbs.db
