@@ -428,7 +428,7 @@ if __name__ == '__main__':
         'trainable=koopman (encoder frozen)',
         'eval_split=train',
         'early_stopping_patience=1000',
-        'early_stopping_restore_best_weights=False',
+        'early_stopping_restore_best_weights=True',
     ])
 
     encoder, dkm = build_model()
@@ -439,7 +439,7 @@ if __name__ == '__main__':
 
     optimizer, scheduler = build_optimizer(encoder, dkm)
 
-    early_stopping = EarlyStopping(patience=1000, min_delta=0.0, restore_best_weights=False, weight_save_fpath=ckpt_filname)
+    early_stopping = EarlyStopping(patience=1000, min_delta=0.0, restore_best_weights=True, weight_save_fpath=ckpt_filname)
 
     logger.write('Initial evaluation on train set before training', phase='train_eval')
     eval(encoder, dkm, train_loader, 0, CONDITION, logger=logger)
@@ -481,8 +481,9 @@ if __name__ == '__main__':
         logger.end_epoch(ei)
         
         if early_stopping.early_stop or (ei == MAX_EPOCH - 1):
-            best_weight = early_stopping.best_weights
-            logger.write(f"Early stopping at epoch {best_weight['epoch']}", phase='summary')
+            best_weight = early_stopping.best_weights or model_weight
+            stop_reason = 'early stop' if early_stopping.early_stop else 'max epoch'
+            logger.write(f"Training finished ({stop_reason}) at best epoch {best_weight['epoch']}", phase='summary')
             results = best_weight['eval_results']
             for ck in ['real']:
                 logger.write(ck, phase='summary')

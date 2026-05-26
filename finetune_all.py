@@ -471,8 +471,9 @@ if __name__ == '__main__':
         logger.end_epoch(ei)
         
         if early_stopping.early_stop or (ei == MAX_EPOCH - 1):
-            best_weight = early_stopping.best_weights
-            logger.write(f"Early stopping at epoch {best_weight['epoch']}", phase='summary')
+            best_weight = early_stopping.best_weights or model_weight
+            stop_reason = 'early stop' if early_stopping.early_stop else 'max epoch'
+            logger.write(f"Training finished ({stop_reason}) at best epoch {best_weight['epoch']}", phase='summary')
             results = best_weight['eval_results']
             for ck in ['real']:
                 logger.write(ck, phase='summary')
